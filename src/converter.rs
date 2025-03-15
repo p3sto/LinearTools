@@ -1,12 +1,15 @@
 use std::{
-    fs::File,
-    io::{Cursor, Read, Seek, SeekFrom},
+    cmp::max,
+    fmt::format,
+    fs::{File, OpenOptions},
+    io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write},
     path::PathBuf,
     time::SystemTime,
 };
 
 use anyhow::{anyhow, Result};
-use byteorder::{BigEndian, ReadBytesExt};
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use zstd::encode_all;
 
 const REGION_DIMENSION: usize = 32;
 const COMPRESSION_TYPE: u8 = b'\x02';
@@ -16,7 +19,7 @@ const LINEAR_SIGNATURE: u64 = 0xc3ff13183cca9d9a;
 const SUPPORTED_VERSION: [u8; 2] = [1, 2];
 const LINEAR_VERSION: u8 = 2;
 const HEADER_SIZE: usize = 8192;
-const CHUNKS_PER_REGION: usize = 1024;
+const CHUNK_HEADER_SIZE: usize = 1024;
 
 type ChunksList = Vec<Option<Chunk>>;
 
@@ -57,7 +60,7 @@ impl Region {
 
 trait Converter {
     fn open_region_file(path: &str) -> Result<Region>;
-    fn convert_region_file(output: PathBuf, region: Region, compression: u8) -> Result<()>;
+    fn write_region_file(region: Region, output: &str, compression: i32) -> Result<()>;
 
     /**
      * Extract the region file's coordinates from its path
@@ -104,14 +107,14 @@ impl LinearConverter {
             .map_err(|e| anyhow!("Zstd decompression failed: {}", e))?;
         let region_len = region_data.len();
 
-        let mut timestamps: Vec<u32> = Vec::with_capacity(CHUNKS_PER_REGION);
-        let mut sizes: Vec<u32> = Vec::with_capacity(CHUNKS_PER_REGION);
+        let mut timestamps: Vec<u32> = Vec::with_capacity(CHUNK_HEADER_SIZE);
+        let mut sizes: Vec<u32> = Vec::with_capacity(CHUNK_HEADER_SIZE);
         let mut actual_chunk_count = 0;
         let mut total_size = 0;
 
         // Extract chunk sizes and timestamps
         let mut header_cursor = Cursor::new(&region_data);
-        for i in 0..CHUNKS_PER_REGION {
+        for i in 0..CHUNK_HEADER_SIZE {
             if header_cursor.position() as usize + 8 > region_len {
                 return Err(anyhow!(
                     "Chunk header size is out of bounds at record {}",
@@ -149,9 +152,9 @@ impl LinearConverter {
         }
 
         // Extract actual chunk data
-        let mut chunks: ChunksList = vec![None; CHUNKS_PER_REGION];
+        let mut chunks: ChunksList = vec![None; CHUNK_HEADER_SIZE];
         let mut data_cursor = Cursor::new(&region_data[HEADER_SIZE..]);
-        for i in 0..CHUNKS_PER_REGION {
+        for i in 0..CHUNK_HEADER_SIZE {
             let size = sizes[i] as usize;
             if size > 0 {
                 let pos = data_cursor.position() as usize;
@@ -176,21 +179,22 @@ impl LinearConverter {
 
 impl Converter for LinearConverter {
     fn open_region_file(path: &str) -> Result<Region> {
-        let mut file: File = File::open(&path).map_err(|_| anyhow!("Could not open file at '{}'", path))?;
+        let mut file: File =
+            File::open(&path).map_err(|_| anyhow!("Could not open file at '{}'", path))?;
         let mut buffer: Vec<u8> = Vec::new();
         file.read_to_end(&mut buffer)?;
 
         let mut cursor = Cursor::new(&buffer);
         let signature_begin = cursor.read_u64::<BigEndian>()?;
         let version = cursor.read_u8()?;
-        cursor.seek(SeekFrom::Current(5))?; // Skip newest_timestamp (4) + compression_level (1) 
+        cursor.seek(SeekFrom::Current(5))?; // Skip newest_timestamp (4) + compression_level (1)
         let chunk_count = cursor.read_u16::<BigEndian>()?;
         let compressed_length = cursor.read_u32::<BigEndian>();
         cursor.seek(SeekFrom::Current(8))?; // Skip
 
         cursor.seek(SeekFrom::End(-8))?;
         let signature_end = cursor.read_u64::<BigEndian>()?;
-        
+
         // Check valid signature_begin
         if signature_begin != LINEAR_SIGNATURE {
             return Err(anyhow!("Invalid header signature for region file"));
@@ -208,7 +212,8 @@ impl Converter for LinearConverter {
 
         let compressed_data = &buffer[32..buffer.len() - 8];
         let (region_x, region_z) = Self::extract_region_coords(&path)?;
-        let (chunks, timestamps) = Self::extract_chunks(region_x, region_z, compressed_data, chunk_count)?;
+        let (chunks, timestamps) =
+            Self::extract_chunks(region_x, region_z, compressed_data, chunk_count)?;
         let modified_time: SystemTime = file.metadata()?.modified()?;
 
         Ok(Region::new(
@@ -220,8 +225,49 @@ impl Converter for LinearConverter {
         ))
     }
 
-    fn convert_region_file(output: PathBuf, region: Region, compression: u8) -> Result<()> {
-        todo!()
+    fn write_region_file(region: Region, output_dir: &str, compression_level: i32) -> Result<()> {
+        let output_file = format!("{output_dir}/r.{}.{}.linear", region.x, region.z);
+        let wip_file = format!("{output_dir}/r.{}.{}.linear.wip", region.x, region.z);
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(wip_file)?;
+
+        let mut newest_timestamp = 0;
+        let mut chunk_count = 0;
+        let mut inner: Vec<u8> = Vec::new();
+        for i in 0..1024 {
+            if let Some(chunk) = region.chunks.get(i).unwrap() {
+                let size = chunk.chunk_data.len() as u32;
+                let timestamp = region.timestamps[i] as u32;
+                inner.extend_from_slice(&size.to_be_bytes());
+                inner.extend_from_slice(&timestamp.to_be_bytes());
+                chunk_count += 1;
+                newest_timestamp = max(timestamp, newest_timestamp);
+            } else {
+                inner.extend_from_slice(&0u64.to_be_bytes());
+            }
+        }
+
+        for i in 0..1024 {
+            if let Some(chunk) = region.chunks.get(i).unwrap() {
+                inner.extend_from_slice(chunk.chunk_data.as_slice());
+            }
+        }
+
+        let compressed = encode_all(inner.as_slice(), compression_level)?;
+        let compressed_length = compressed.len();
+        let mut buffer = BufWriter::new(file);
+
+        // Write header
+        buffer.write_u64::<BigEndian>(LINEAR_SIGNATURE)?;
+        buffer.write_u8(LINEAR_VERSION)?;
+        buffer.write_u32::<BigEndian>(newest_timestamp)?;
+        buffer.write_u8(compression_level as u8)?;
+        buffer.write_u8(compressed_length as u8)?;
+
+        Ok(())
     }
 }
 
@@ -231,7 +277,7 @@ impl Converter for McaConverter {
         todo!()
     }
 
-    fn convert_region_file(output: PathBuf, region: Region, compression: u8) -> Result<()> {
+    fn write_region_file(region: Region, output: &str, compression: u8) -> Result<()> {
         todo!()
     }
 }
