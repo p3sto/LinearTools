@@ -1,15 +1,14 @@
 use std::{
     cmp::max,
-    fmt::format,
-    fs::{File, OpenOptions},
-    io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write},
+    fs::{self, File, OpenOptions},
+    io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write},
     path::PathBuf,
     time::SystemTime,
 };
 
 use anyhow::{anyhow, Result};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use zstd::encode_all;
+use zstd::{encode_all, zstd_safe::InBuffer};
 
 const REGION_DIMENSION: usize = 32;
 const COMPRESSION_TYPE_ZLIB: u8 = 2;
@@ -86,6 +85,19 @@ trait Converter {
             .parse()?;
 
         Ok((x, z))
+    }
+    /*
+     * Reads a file to buffer and returns a
+     */
+    fn read_to_buffer(path: &str) -> Result<Vec<u8>> {
+        if fs::exists(path)? {
+            let mut file = File::open(path).map_err(|_| anyhow!("Failed to open file: {path}"))?;
+            let mut buffer: Vec<u8> = Vec::new();
+            file.read_to_end(&mut buffer);
+            Ok(buffer)
+        } else {
+            Err(anyhow!("File does not exist"))
+        }
     }
 }
 
@@ -278,7 +290,17 @@ impl Converter for LinearV1Converter {
 struct McaConverter;
 impl Converter for McaConverter {
     fn open_region_file(path: &str) -> Result<Region> {
-        todo!()
+        let sector = 4096;
+
+        let chunk_starts: Vec<u8> = Vec::new();
+        let chunk_sizes: Vec<u8> = Vec::new();
+        let timestamps: Vec<u8> = Vec::new();
+        let chunks: Vec<u8> = Vec::new();
+
+        let (region_x, region_z) = Self::extract_region_coords(path)?;
+        for i in 0..1024 {}
+
+        Err(anyhow!("Error"))
     }
 
     fn write_region_file(region: Region, output: &str, compression: i8) -> Result<()> {
