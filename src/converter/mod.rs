@@ -64,24 +64,30 @@ impl Region {
         x: i32,
         z: i32,
         modified_time: u32,
-        t: [u32; MAX_REGION_CHUNKS],
+        timestamps: [u32; MAX_REGION_CHUNKS],
     ) -> Self {
         Self {
             chunks,
             x,
             z,
             modified_time,
-            timestamps: t,
+            timestamps,
         }
     }
 }
 
 #[derive(Clone)]
-pub enum RegionFormat {
+pub enum RegionType {
     Anvil,
     LinearV1,
     LinearV2,
 }
+
+pub trait RegionFormat<T> {
+    fn from_bytes(&self, bytes: &[u8]) -> Result<T>;
+    fn to_bytes(&self) -> Result<Vec<u8>>;
+}
+
 pub trait RegionConverter {
     fn open_region_file(path: &str) -> Result<Region>;
     fn write_region_file(region: Region, output: &str, compression: i8) -> Result<()>;

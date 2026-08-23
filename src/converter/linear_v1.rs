@@ -1,15 +1,14 @@
-use crate::{
-    converter::{
-        Chunk, Region, RegionChunks, RegionConverter, MAX_REGION_CHUNKS, REGION_DIMENSION,
-    },
-    error,
-};
+use crate::{converter::*, error};
 
 use std::{
-    char::MAX, cmp, error::Error, fs::OpenOptions, io::{BufWriter, Cursor, Read, Seek, SeekFrom}, ops::Deref, time::SystemTime
+    cmp,
+    fs::{self, OpenOptions},
+    io::{BufWriter, Cursor, Read, Write},
+    ops::Deref,
+    time::SystemTime,
 };
 
-use byteorder::{BigEndian, ReadBytesExt};
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use error::Result;
 use zstd::encode_all;
 
@@ -28,7 +27,7 @@ struct LinearSuperblock {
 }
 
 impl LinearSuperblock {
-    fn read(bytes: &[u8]) -> Result<Self> {
+    fn read_bytes(bytes: &[u8]) -> Result<Self> {
         let mut bytes = bytes;
         if bytes.len() < LINEAR_SUPERBLOCK_SIZE {
             return Err("Invalid superblock size".into());
@@ -51,6 +50,18 @@ impl LinearSuperblock {
             compressed_len,
             reserved,
         })
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut buffer: Vec<u8> = Vec::with_capacity(LINEAR_SUPERBLOCK_SIZE);
+        buffer.extend_from_slice(&self.signature.to_be_bytes());
+        buffer.push(self.version);
+        buffer.extend_from_slice(&self.newest_timestamp.to_be_bytes());
+        buffer.extend_from_slice(&self.compression_level.to_be_bytes());
+        buffer.extend_from_slice(&self.chunk_count.to_be_bytes());
+        buffer.extend_from_slice(&self.compressed_len.to_be_bytes());
+        buffer.extend_from_slice(&self.reserved.to_be_bytes());
+        buffer
     }
 }
 
@@ -83,7 +94,7 @@ struct LinearChunkData {
 impl LinearChunkData {
     fn read_bytes(
         bytes: &[u8],
-        superblock: LinearSuperblock,
+        superblock: &LinearSuperblock,
         region_x: i32,
         region_z: i32,
     ) -> Result<Self> {
@@ -96,6 +107,7 @@ impl LinearChunkData {
             return Err("Insufficient bytes to read chunk data headers".into());
         }
 
+        // Extract chunk headers
         let mut chunk_headers = ChunkHeaders::default();
         let mut chunk_count = 0;
         let mut total_size = 0;
@@ -109,14 +121,17 @@ impl LinearChunkData {
             }
         }
 
+        // Verify that chunk count matches superblock
         if chunk_count != superblock.chunk_count {
             return Err("Chunk count invalid".into());
         }
 
+        // Verify size of chunk data
         if total_size != (LINEAR_HEADER_SIZE + decompressed_len) as u32 {
             return Err("Invalid decompression size".into());
         }
 
+        // Extract region chunks
         let mut region_chunks = RegionChunks::default();
         for i in 0..MAX_REGION_CHUNKS {
             let size = chunk_headers.0[i].size;
@@ -135,24 +150,24 @@ impl LinearChunkData {
         })
     }
 
-    fn to_bytes(&self) -> Result<&[u8]> {
-        let mut bytes: Vec<u8> = Vec::new();
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut buffer: Vec<u8> = Vec::new();
         for header in &self.headers.0 {
-            bytes.extend_from_slice(&header.size.to_be_bytes());
-            bytes.extend_from_slice(&header.timestamp.to_be_bytes());
+            buffer.extend_from_slice(&header.size.to_be_bytes());
+            buffer.extend_from_slice(&header.timestamp.to_be_bytes());
         }
 
         for chunk in &self.chunks.0 {
             match chunk {
                 Some(c) => {
-                    bytes.extend_from_slice(&c.x.to_be_bytes());
-                    bytes.extend_from_slice(&c.z.to_be_bytes());
+                    buffer.extend_from_slice(&c.x.to_be_bytes());
+                    buffer.extend_from_slice(&c.z.to_be_bytes());
                 }
                 None => continue,
             }
         }
 
-        Ok(bytes.)
+        buffer
     }
 }
 
@@ -160,15 +175,18 @@ struct LinearFooter(u64);
 
 impl LinearFooter {
     fn read_bytes(bytes: &[u8]) -> Result<Self> {
-       let mut bytes = bytes;
-       let val = bytes.read_u64::<BigEndian>()?; 
-        Ok(LinearFooter(val))
-    }
-}
+        if bytes.len() < 8 {
+            return Err("Unsifficient byte length to read footer".into());
+        }
 
-impl From<u64> for LinearFooter {
-    fn from(value: u64) -> Self {
-        Self(value)
+        let footer = u64::from_be_bytes(bytes.try_into()?);
+        Ok(LinearFooter(footer))
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut buffer: Vec<u8> = Vec::with_capacity(8);
+        buffer.extend_from_slice(&self.0.to_be_bytes());
+        buffer
     }
 }
 struct LinearRegionFile {
@@ -178,26 +196,21 @@ struct LinearRegionFile {
 }
 
 impl LinearRegionFile {
-    fn read(bytes: &[u8], region_x: i32, region_z: i32) -> Result<LinearRegionFile> {
-        let superblock = LinearSuperblock::read(&bytes[0..32])?;
-        
-        let footer = LinearFooter::from();
+    fn read_bytes(bytes: &[u8], region_x: i32, region_z: i32) -> Result<LinearRegionFile> {
+        let len = bytes.len();
+        let superblock = LinearSuperblock::read_bytes(&bytes[0..32])?;
+        let chunk_data =
+            LinearChunkData::read_bytes(&bytes[33..len - 8], &superblock, region_x, region_z)?;
+        let footer = LinearFooter::read_bytes(&bytes[(len - 8)..])?;
 
         if superblock.signature != LINEAR_SIGNATURE {
             return Err("Invalid header signature".into());
         }
 
-        if footer != LINEAR_SIGNATURE {
+        if footer.0 != LINEAR_SIGNATURE {
             return Err("Invalid footer signature".into());
         }
 
-        let chunk_data = LinearChunkData::read_bytes(
-            &mut cursor,
-            superblock.compressed_len,
-            region_x,
-            region_z,
-        )?;
-        let footer = LinearFooter(cursor.read_u8()?);
         Ok(LinearRegionFile {
             superblock,
             chunk_data,
@@ -205,32 +218,42 @@ impl LinearRegionFile {
         })
     }
 
-    fn to_bytes() -> Result<Vec<u8>> {
+    fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&self.superblock.to_bytes());
+        bytes.extend_from_slice(&self.chunk_data.to_bytes());
+        bytes.extend_from_slice(&self.footer.to_bytes());
         Ok(bytes)
     }
 }
 
 struct LinearV1Converter;
 impl LinearV1Converter {
-    fn verify_region(path: &str) -> Result<()> {
-        let buffer = Self::read_to_buffer(path)?;
-
-        let superblock = LinearSuperblock::read(&mut cursor)?;
-
-        if superblock.signature_begin != LINEAR_SIGNATURE {
-            return Err("Invalid header signature for region file");
+    fn verify(superblock: &LinearSuperblock, footer: &LinearFooter) -> Result<()> {
+        if superblock.signature != LINEAR_SIGNATURE {
+            return Err("Invalid header signature for region file".into());
         }
 
         if superblock.version != 1 {
-            return Err("Invalid version number (expected 1, found: {version})");
+            return Err(format!(
+                "Invalid version number (expected 1, found: {})",
+                superblock.version
+            )
+            .into());
         }
 
-        if buf != LINEAR_SIGNATURE {
-            return Err("Invalid footer signature for region file");
+        if footer.0 != LINEAR_SIGNATURE {
+            return Err("Invalid footer signature for region file".into());
         }
 
         Ok(())
+    }
+
+    fn verify_region(path: &str) -> Result<()> {
+        let buffer = Self::read_to_buffer(path)?;
+        let superblock = LinearSuperblock::read_bytes(&buffer[0..32])?;
+        let footer = LinearFooter::read_bytes(&buffer[buffer.len() - 8..])?;
+        Self::verify(&superblock, &footer)
     }
 }
 
@@ -240,60 +263,31 @@ impl RegionConverter for LinearV1Converter {
         let (region_x, region_z) = Self::parse_region_coords(path)?;
         let region_file = LinearRegionFile::read_bytes(&buffer, region_x, region_z)?;
 
-        if region_file.superblock.signature != LINEAR_SIGNATURE
-            || region_file.footer.0 != LINEAR_SIGNATURE
-        {
+        if region_file.superblock.signature != LINEAR_SIGNATURE {
+            return Err("Invalid header signature for region file".into());
+        }
+
+        if region_file.footer.0 != LINEAR_SIGNATURE {
             return Err("Invalid footer signature for region file".into());
         }
 
-        // Extract chunk sizes and timestamps from header
-        let mut cursor = Cursor::new(&decoded);
-        for i in 0..MAX_REGION_CHUNKS {
-            let size = cursor
-                .read_u32::<BigEndian>()
-                .map_err(|_| "Failed to read chunk size for chunk {i}")?;
-            let timestamp = cursor
-                .read_u32::<BigEndian>()
-                .map_err(|_| "Failed to read chunk timestamp for chunk {i}")?;
+        let modified_time: u32 = fs::metadata(&path)?
+            .modified()?
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_secs() as u32;
 
-            timestamps.push(timestamp);
-            sizes.push(size);
-            total_size += size;
+        let timestamps: [u32; MAX_REGION_CHUNKS] = region_file
+            .chunk_data
+            .headers
+            .map(|header| header.timestamp);
 
-            if size != 0 {
-                actual_chunk_count += 1;
-            }
-        }
-
-        let total = total_size + LINEAR_HEADER_SIZE;
-        if total != decoded_len {
-            return Err(
-                "Decompressed size is invalid: expected {total} bytes, got {decoded_len} bytes",
-            );
-        }
-
-        if actual_chunk_count != chunk_count {
-            return Err("Chunk count is invalid: expected {chunk_count}, got {actual_chunk_count}");
-        }
-
-        // Extract chunk data
-        let mut chunks: Vec<Option<Chunk>> = vec![None; MAX_REGION_CHUNKS];
-        for i in 0..MAX_REGION_CHUNKS {
-            let size = sizes[i];
-            if size > 0 {
-                let mut data = vec![0u8; size as usize];
-                let x = FILE_HEADER_SIZE * region_x + (i as i32) % FILE_HEADER_SIZE;
-                let z = FILE_HEADER_SIZE * region_z + (i as i32) / FILE_HEADER_SIZE;
-                cursor
-                    .read_exact(&mut data)
-                    .map_err(|_| "Failed to read chunk data for chunk {i}")?;
-                chunks[i] = Some(Chunk::new(x, z, &data));
-            }
-        }
-
-        let modified_time: SystemTime = fs::metadata(&path)?.modified()?;
-        let region = Region::new(chunks, region_x, region_z, modified_time, &timestamps);
-        Ok(region)
+        Ok(Region::new(
+            region_file.chunk_data.chunks,
+            region_x,
+            region_z,
+            modified_time,
+            timestamps,
+        ))
     }
 
     fn write_region_file(region: Region, output_dir: &str, compression_level: i8) -> Result<()> {

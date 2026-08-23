@@ -6,12 +6,12 @@ use crate::converter::*;
 pub struct Worker {
     queue: Vec<String>,
     threads: usize,
-    from: RegionFormat,
-    to: RegionFormat,
+    from: RegionType,
+    to: RegionType,
 }
 
 impl Worker {
-    pub fn new(queue: Vec<String>, threads: usize, from: RegionFormat, to: RegionFormat) -> Self {
+    pub fn new(queue: Vec<String>, threads: usize, from: RegionType, to: RegionType) -> Self {
         Self {
             queue,
             threads,
@@ -25,9 +25,9 @@ impl Worker {
 
         self.queue.par_iter().for_each(|file| {
             let region = match self.from {
-                RegionFormat::Anvil => todo!(),
-                RegionFormat::LinearV1 => todo!(),
-                RegionFormat::LinearV2 => todo!(),
+                RegionType::Anvil => todo!(),
+                RegionType::LinearV1 => todo!(),
+                RegionType::LinearV2 => todo!(),
                 _ => (),
             };
         });

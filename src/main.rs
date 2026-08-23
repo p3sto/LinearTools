@@ -1,9 +1,8 @@
+use converter;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use converter::RegionFormat;
 
-mod converter;
 mod error;
 mod worker;
 
@@ -48,8 +47,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Convert {
-        from: RegionFormat,
-        to: RegionFormat,
+        from: RegionType,
+        to: RegionType,
         output: Option<PathBuf>,
     },
     Verify,
